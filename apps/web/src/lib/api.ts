@@ -388,6 +388,13 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify({ accountId, friendIds }),
       }),
+    getLinkBaseUrl: () =>
+      fetchApi<{ success: boolean; data: string | null }>('/api/account-settings/link-base-url'),
+    updateLinkBaseUrl: (value: string) =>
+      fetchApi<{ success: boolean; error?: string }>('/api/account-settings/link-base-url', {
+        method: 'PUT',
+        body: JSON.stringify({ value }),
+      }),
   },
 
   // ── Round 2 APIs ─────────────────────────────────────────────────────────
@@ -431,6 +438,9 @@ export const api = {
       loginChannelId?: string | null;
       loginChannelSecret?: string | null;
       liffId?: string | null;
+      ogSiteName?: string | null;
+      ogDefaultImageUrl?: string | null;
+      ogDefaultDescription?: string | null;
     }) =>
       fetchApi<ApiResponse<LineAccount>>('/api/line-accounts', {
         method: 'POST',
@@ -459,6 +469,9 @@ export const api = {
           | 'isActive'
           | 'country'
           | 'role'
+          | 'ogSiteName'
+          | 'ogDefaultDescription'
+          | 'ogDefaultImageUrl'
         >
       >,
     ) => {
@@ -518,6 +531,69 @@ export const api = {
       fetchApi<ApiResponse<{ affiliateId: string; affiliateName: string; code: string; commissionRate: number; totalClicks: number; totalConversions: number; totalRevenue: number }>>(
         `/api/affiliates/${id}/report?` + new URLSearchParams(params as Record<string, string>),
       ),
+    /** v2 report: clicks, friendAdds, conversionsByPoint, estimatedCommission, duplicateFlags */
+    reportV2: (id: string, params?: { startDate?: string; endDate?: string }) =>
+      fetchApi<ApiResponse<{
+        affiliateId: string;
+        affiliateName: string;
+        code: string;
+        commissionRate: number;
+        clicks: number;
+        linkClicks: number;
+        friendAdds: number;
+        conversions: number;
+        conversionsByPoint: Array<{ conversionPointId: string; name: string; count: number; value: number }>;
+        revenue: number;
+        estimatedCommission: number;
+        duplicateFlags: Array<{ friendId: string; identityKey: string }>;
+      }>>(`/api/affiliates/${id}/report?` + new URLSearchParams(params as Record<string, string>)),
+    /** Cursor-paginated attributed-friend journey summaries */
+    journeys: (id: string, params?: { limit?: number; beforeAt?: string; beforeId?: string }) => {
+      const query = new URLSearchParams();
+      if (params?.limit !== undefined) query.set('limit', String(params.limit));
+      if (params?.beforeAt) query.set('beforeAt', params.beforeAt);
+      if (params?.beforeId) query.set('beforeId', params.beforeId);
+      const qs = query.toString();
+      return fetchApi<{
+        success: boolean;
+        data: Array<{
+          friendId: string;
+          displayName: string | null;
+          addedAt: string;
+          refCode: string | null;
+          touchCount: number;
+          formCount: number;
+          conversionCount: number;
+          lastEventAt: string;
+        }>;
+        nextCursor: { beforeAt: string; beforeId: string } | null;
+      }>(`/api/affiliates/${id}/journeys${qs ? `?${qs}` : ''}`);
+    },
+    /** List ref_code links for an affiliate (loaded on detail expand) */
+    links: (id: string) =>
+      fetchApi<ApiResponse<Array<{
+        id: string;
+        affiliate_id: string;
+        ref_code: string;
+        label: string | null;
+        line_account_id: string | null;
+        is_active: number;
+        created_at: string;
+        click_count: number;
+      }>>>(`/api/affiliates/${id}/links`),
+    /** All-affiliates aggregate report (single-pass, no N+1) */
+    allReport: (params?: { startDate?: string; endDate?: string }) =>
+      fetchApi<ApiResponse<Array<{
+        affiliateId: string;
+        affiliateName: string;
+        code: string;
+        commissionRate: number;
+        totalClicks: number;
+        totalConversions: number;
+        totalRevenue: number;
+        linkCount: number;
+        friendAdds: number;
+      }>>>('/api/affiliates-report?' + new URLSearchParams(params as Record<string, string>)),
   },
   templates: {
     list: (category?: string) =>
@@ -662,12 +738,16 @@ export const api = {
       ),
   },
   chats: {
-    list: (params?: { status?: string; operatorId?: string; accountId?: string; unansweredOnly?: boolean }) => {
+    list: (params?: { status?: string; operatorId?: string; accountId?: string; unansweredOnly?: boolean; limit?: number; beforeAt?: string; beforeId?: string }) => {
       const query: Record<string, string> = {}
       if (params?.status) query.status = params.status
       if (params?.operatorId) query.operatorId = params.operatorId
       if (params?.accountId) query.lineAccountId = params.accountId
       if (params?.unansweredOnly) query.unansweredOnly = '1'
+      if (params?.limit !== undefined) query.limit = String(params.limit)
+      // カーソルページング: (lastMessageAt, friendId) の複合カーソルより古い行を返す
+      if (params?.beforeAt) query.beforeAt = params.beforeAt
+      if (params?.beforeId) query.beforeId = params.beforeId
       return fetchApi<ApiResponse<Chat[]>>(
         '/api/chats?' + new URLSearchParams(query),
       )
@@ -1156,6 +1236,30 @@ export const api = {
     funnel: (id: string) =>
       fetchApi<ApiResponse<EntryRouteFunnel>>(`/api/entry-routes/${id}/funnel`),
   },
+  // tracked_links は別管理だが /inflow-links 一覧で「(未登録)」誤表示を防ぐため
+  // 同ページから参照する。Worker の applyRefAttribution は entry_routes → tracked_links
+  // の順でフォールバックするので、tracked_links 登録済み ref は実際にはシナリオ発火している。
+  trackedLinks: {
+    list: () =>
+      fetchApi<
+        ApiResponse<
+          Array<{
+            id: string
+            name: string
+            originalUrl: string
+            trackingUrl: string
+            tagId: string | null
+            scenarioId: string | null
+            introTemplateId: string | null
+            rewardTemplateId: string | null
+            isActive: boolean
+            clickCount: number
+            createdAt: string
+            updatedAt: string
+          }>
+        >
+      >('/api/tracked-links'),
+  },
   pools: {
     list: () => fetchApi<ApiResponse<TrafficPool[]>>('/api/traffic-pools'),
     get: (id: string) => fetchApi<ApiResponse<TrafficPool>>(`/api/traffic-pools/${id}`),
@@ -1253,6 +1357,7 @@ export interface BookingMenu {
   base_price: number;
   sort_order: number;
   is_active: number;
+  auto_tag_id: string | null;
 }
 
 export interface BookingStaff {
@@ -1284,6 +1389,7 @@ export interface StaffMenuMatrix {
 
 export interface BookingRequest {
   id: string;
+  friend_id: string;
   starts_at: string;
   ends_at: string;
   status: string;
@@ -1449,6 +1555,11 @@ export interface EventDetail {
   reminder_hours_before: number | null;
   is_published: number;
   sort_order: number;
+  confirmation_message_extra: string | null;
+  reminder_message_extra: string | null;
+  og_title: string | null;
+  og_description: string | null;
+  og_image_url: string | null;
   // Multi-account fields (migration 040, broadcasts と同パターン)
   target_type?: 'single' | 'multi-account-dedup';
   // Worker は JSON 文字列で返す。UI 側で parse して string[] を扱う。
