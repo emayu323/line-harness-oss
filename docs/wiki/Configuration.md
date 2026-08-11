@@ -48,6 +48,8 @@ crons = ["*/5 * * * *"]
 | `LIFF_URL` | 任意 | string | LIFF アプリ URL | `https://liff.line.me/12345-abcde` |
 | `LINE_LOGIN_CHANNEL_ID` | 任意 | string | LINE Login チャネルID（UUID連携用） | `9876543210` |
 | `LINE_LOGIN_CHANNEL_SECRET` | 任意 | string | LINE Login チャネルシークレット | `xyz789...` |
+| `GOOGLE_SERVICE_ACCOUNT_EMAIL` | 任意 | string | 予約とGoogleカレンダーを同期するサービスアカウント | `calendar-sync@project.iam.gserviceaccount.com` |
+| `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` | 任意 | string | 上記サービスアカウントのPKCS#8秘密鍵 | `-----BEGIN PRIVATE KEY-----...` |
 
 ### シークレット設定コマンド
 
@@ -60,6 +62,8 @@ npx wrangler secret put LINE_CHANNEL_ID
 npx wrangler secret put LIFF_URL
 npx wrangler secret put LINE_LOGIN_CHANNEL_ID
 npx wrangler secret put LINE_LOGIN_CHANNEL_SECRET
+npx wrangler secret put GOOGLE_SERVICE_ACCOUNT_EMAIL
+npx wrangler secret put GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY
 
 # 設定済みシークレット一覧確認
 npx wrangler secret list
@@ -82,6 +86,15 @@ export type Env = {
   };
 };
 ```
+
+### 予約とGoogleカレンダーの同期
+
+1. Google CloudでGoogle Calendar APIを有効化し、サービスアカウントを作成します。
+2. 上記2つのWorkerシークレットを設定します。秘密鍵はD1や管理画面には保存しません。
+3. Googleカレンダーの「設定と共有」で、サービスアカウントのメールアドレスへ「予定の変更」権限を付けます。
+4. LINE Harnessの「予約管理 → スタッフ → 受付時間」で、対象スタッフのGoogleカレンダーIDを入力します。
+
+接続後は、空き枠を表示するたびにGoogleの予定を確認します。予約が確定するとGoogleにも予定を作り、予約を取り消すとGoogleの予定も削除します。Google側を確認できない場合は、二重予約を防ぐため該当スタッフの枠を一時的に非表示にします。
 
 ### 管理画面の環境変数
 
@@ -108,21 +121,21 @@ npx wrangler d1 create line-crm
 
 ```bash
 # 本番
-npx wrangler d1 execute line-crm --file=packages/db/schema.sql
+npx wrangler d1 execute your-database --file=packages/db/schema.sql
 
 # ローカル開発
 pnpm db:migrate:local
-# = wrangler d1 execute line-crm --file=packages/db/schema.sql --local
+# = wrangler d1 execute your-database --file=packages/db/schema.sql --local
 ```
 
 ### D1 ダッシュボード確認
 
 ```bash
 # テーブル一覧確認
-npx wrangler d1 execute line-crm --command="SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+npx wrangler d1 execute your-database --command="SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
 
 # レコード数確認
-npx wrangler d1 execute line-crm --command="SELECT COUNT(*) FROM friends"
+npx wrangler d1 execute your-database --command="SELECT COUNT(*) FROM friends"
 ```
 
 ### D1 バインディング
@@ -179,20 +192,26 @@ crons = ["0 * * * *"]
 
 ## CORS 設定
 
-MVP では全オリジン許可:
+管理画面は Cookie 認証を使うため、CORS は全許可ではなく管理画面の
+Origin だけを許可します。初回セットアップ / アップデート時に
+`create-line-harness` が次の Worker シークレットを設定します。
 
-```typescript
-// apps/worker/src/index.ts
-app.use('*', cors({ origin: '*' }));
+```bash
+ADMIN_ORIGIN=https://<admin>.pages.dev
+ADMIN_ALLOW_CROSS_SITE=true
 ```
 
-本番環境では管理画面のドメインに制限することを推奨:
+Cloudflare Pages のデプロイ直後に表示される
+`https://<hash>.<admin>.pages.dev` のようなプレビューURLも、同じ Pages
+プロジェクトとして許可されます。まったく別の Pages プロジェクトや別ドメインは
+拒否されます。
 
 ```typescript
 app.use('*', cors({
-  origin: ['https://your-admin.pages.dev', 'https://your-domain.com'],
-  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowHeaders: ['Authorization', 'Content-Type'],
+  origin: (origin, c) => resolveCorsOrigin(c.env, origin, c.req.url),
+  credentials: true,
+  allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token'],
 }));
 ```
 
