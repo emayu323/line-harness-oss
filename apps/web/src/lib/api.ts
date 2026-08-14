@@ -34,12 +34,43 @@ import type {
   PoolAccount,
 } from '@line-crm/shared'
 
+/** Affiliate offer (案件) as returned by the worker. */
+export type AffiliateOffer = {
+  id: string
+  name: string
+  description: string | null
+  rewardAmount: number | null
+  rewardMiles: number
+  mileageProgramId: string
+  lineAccountId: string | null
+  tagId: string | null
+  scenarioId: string | null
+  isActive: boolean
+  createdAt: string
+}
+
+/** Approval queue row as returned by /api/conversions/approvals */
+export type ConversionApprovalItem = {
+  eventId: string
+  createdAt: string
+  friendId: string
+  friendName: string | null
+  affiliateId: string
+  affiliateName: string | null
+  offerName: string | null
+  conversionPointName: string | null
+  value: number | null
+  approvalStatus: 'pending' | 'approved' | 'rejected'
+  duplicateFlag: boolean
+}
+
 /** Broadcast type from API (now camelCase after worker serialization) */
 export type ApiBroadcast = Omit<Broadcast, 'targetType'> & {
   targetType: BroadcastTargetType;
   accountIds: string[] | null;
   dedupPriority: string[] | null;
   failedAccountIds: string[] | null;
+  trackLinks: boolean;
 };
 
 export type BroadcastInsight = {
@@ -84,6 +115,21 @@ export function setCsrfToken(token: string | undefined | null): void {
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 
+/**
+ * Non-2xx API responses. message keeps the legacy `API error: <status>` shape
+ * (existing catch blocks render e.message), while `status` lets callers
+ * branch on the code without parsing the string.
+ */
+export class ApiError extends Error {
+  readonly status: number
+
+  constructor(status: number) {
+    super(`API error: ${status}`)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
 export async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
   const method = (options?.method ?? 'GET').toUpperCase()
   const csrfHeaders: Record<string, string> = {}
@@ -101,7 +147,7 @@ export async function fetchApi<T>(path: string, options?: RequestInit): Promise<
       ...options?.headers,
     },
   })
-  if (!res.ok) throw new Error(`API error: ${res.status}`)
+  if (!res.ok) throw new ApiError(res.status)
   if (res.status === 204) return undefined as T
   return res.json() as Promise<T>
 }
@@ -129,6 +175,107 @@ export type FriendListParams = {
 }
 
 export type FriendWithTags = Friend & { tags: Tag[] }
+export type FollowerImportState = {
+  version: 1
+  capability: 'unknown' | 'available' | 'unavailable'
+  phase: 'not_started' | 'importing_ids' | 'hydrating_profiles' | 'completed'
+  eligibilityCheckedAt: string | null
+  startedAt: string | null
+  completedAt: string | null
+  updatedAt: string
+  received: number
+  imported: number
+  reactivated: number
+  claimedUnassigned: number
+  alreadyPresent: number
+  conflicts: number
+  invalid: number
+  profilesProcessed: number
+  profilesUpdated: number
+  profileErrors: number
+  lastError: string | null
+}
+export type FriendFormSubmission = {
+  id: string
+  formId: string
+  formName: string
+  fields: Array<{ name: string; label: string }>
+  data: Record<string, unknown>
+  createdAt: string
+}
+export type FriendDetail = FriendWithTags & { formSubmissions: FriendFormSubmission[] }
+export type MileageSummary = {
+  programId: string
+  programName: string
+  available: number
+  pending: number
+  lifetimeEarned: number
+  spent: number
+}
+export type MileageHistoryItem = {
+  id: string
+  entryType: 'grant' | 'reversal' | 'spend' | 'expiration' | 'adjustment'
+  status: 'pending' | 'available' | 'void'
+  amount: number
+  reason: string
+  source: string
+  sourceEventId: string | null
+  occurredAt: string
+}
+export type MileageRule = {
+  id: string
+  name: string
+  eventType: string
+  source: string | null
+  amount: number
+  initialStatus: 'pending' | 'available'
+  conditions: {
+    dailyCapActions?: number
+    uniquePerSubject?: boolean
+    uniquePerSubjectPerDay?: boolean
+    ignoreMultiplier?: boolean
+    beneficiary?: 'actor' | 'referrer'
+    uniquePerReferredFriend?: boolean
+    uniquePerReferredFriendPerSubject?: boolean
+  }
+  isActive: boolean
+  createdAt: string
+  updatedAt: string
+}
+export type MileageAdminMember = {
+  identityKey: string
+  primaryFriendId: string
+  displayName: string
+  pictureUrl: string | null
+  accountCount: number
+  accountNames: string[]
+  available: number
+  pending: number
+  lifetimeEarned: number
+  actionCount: number
+  messageCount: number
+  linkClickCount: number
+  formCount: number
+  bookingCount: number
+  webinarCount: number
+  instagramCount: number
+  followingDays: number
+  unfollowCount: number
+  referralMiles: number
+  qualityReferralCount: number
+  lastActivityAt: string | null
+}
+export type MileageAdminOverview = {
+  summary: {
+    totalMembers: number
+    totalAvailable: number
+    activeMembers30d: number
+    totalActions: number
+    queuedEvents: number
+  }
+  members: MileageAdminMember[]
+  pagination: { total: number; limit: number; offset: number }
+}
 /** Friend list items, optionally hydrated with chat status (when ?includeChatStatus=true) */
 export type FriendListItem = FriendWithTags & Partial<{
   latestIncomingMessage: { content: string; messageType: string; createdAt: string } | null
@@ -155,7 +302,11 @@ export const api = {
       )
     },
     get: (id: string) =>
-      fetchApi<ApiResponse<FriendWithTags>>(`/api/friends/${id}`),
+      fetchApi<ApiResponse<FriendDetail>>(`/api/friends/${id}`),
+    mileage: (id: string, limit = 10) =>
+      fetchApi<ApiResponse<{ summary: MileageSummary; history: MileageHistoryItem[] }>>(
+        `/api/friends/${id}/mileage?limit=${limit}`,
+      ),
     count: (params?: { accountId?: string }) => {
       const query = params?.accountId ? '?lineAccountId=' + params.accountId : ''
       return fetchApi<ApiResponse<{ count: number }>>('/api/friends/count' + query)
@@ -175,11 +326,22 @@ export const api = {
       ),
   },
   tags: {
-    list: () =>
-      fetchApi<ApiResponse<Tag[]>>('/api/tags'),
+    /** withCounts で friendCount 付き (JOIN 集計 — タグ管理ページ用)。 */
+    list: (params?: { withCounts?: boolean }) =>
+      fetchApi<ApiResponse<Tag[]>>(`/api/tags${params?.withCounts ? '?withCounts=1' : ''}`),
     create: (data: { name: string; color: string }) =>
       fetchApi<ApiResponse<Tag>>('/api/tags', {
         method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    updateMileage: (id: string, data: {
+      rewardMiles: number
+      referralRewardMiles: number
+      multiplierBps: number | null
+      multiplierPriority: number
+    }) =>
+      fetchApi<ApiResponse<{ tag: Tag; queued: number }>>(`/api/tags/${id}/mileage`, {
+        method: 'PATCH',
         body: JSON.stringify(data),
       }),
     delete: (id: string) =>
@@ -290,9 +452,13 @@ export const api = {
       lineAccountId?: string | null
       accountIds?: string[]
       dedupPriority?: string[]
-    }) =>
+      trackLinks?: boolean
+    }, options?: { idempotencyKey?: string }) =>
       fetchApi<ApiResponse<ApiBroadcast>>('/api/broadcasts', {
         method: 'POST',
+        headers: options?.idempotencyKey
+          ? { 'Idempotency-Key': options.idempotencyKey }
+          : undefined,
         body: JSON.stringify(data),
       }),
     update: (
@@ -304,6 +470,7 @@ export const api = {
         targetType?: ApiBroadcast['targetType']
         targetTagId?: string | null
         scheduledAt?: string | null
+        trackLinks?: boolean
       }
     ) =>
       fetchApi<ApiResponse<ApiBroadcast>>(`/api/broadcasts/${id}`, {
@@ -388,6 +555,20 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify({ accountId, friendIds }),
       }),
+    getLinkBaseUrl: () =>
+      fetchApi<{ success: boolean; data: string | null }>('/api/account-settings/link-base-url'),
+    updateLinkBaseUrl: (value: string) =>
+      fetchApi<{ success: boolean; error?: string }>('/api/account-settings/link-base-url', {
+        method: 'PUT',
+        body: JSON.stringify({ value }),
+      }),
+    getTrackedLinkBaseUrl: () =>
+      fetchApi<{ success: boolean; data: string | null }>('/api/account-settings/tracked-link-base-url'),
+    updateTrackedLinkBaseUrl: (value: string) =>
+      fetchApi<{ success: boolean; error?: string }>('/api/account-settings/tracked-link-base-url', {
+        method: 'PUT',
+        body: JSON.stringify({ value }),
+      }),
   },
 
   // ── Round 2 APIs ─────────────────────────────────────────────────────────
@@ -431,6 +612,9 @@ export const api = {
       loginChannelId?: string | null;
       loginChannelSecret?: string | null;
       liffId?: string | null;
+      ogSiteName?: string | null;
+      ogDefaultImageUrl?: string | null;
+      ogDefaultDescription?: string | null;
     }) =>
       fetchApi<ApiResponse<LineAccount>>('/api/line-accounts', {
         method: 'POST',
@@ -459,6 +643,9 @@ export const api = {
           | 'isActive'
           | 'country'
           | 'role'
+          | 'ogSiteName'
+          | 'ogDefaultDescription'
+          | 'ogDefaultImageUrl'
         >
       >,
     ) => {
@@ -476,6 +663,23 @@ export const api = {
         method: 'PATCH',
         body: JSON.stringify({ ordered }),
       }),
+    followerImportState: (id: string) =>
+      fetchApi<ApiResponse<FollowerImportState>>(`/api/line-accounts/${id}/follower-import`),
+    detectFollowerImport: (id: string) =>
+      fetchApi<ApiResponse<FollowerImportState>>(
+        `/api/line-accounts/${id}/follower-import/detect`,
+        { method: 'POST' },
+      ),
+    startFollowerImport: (id: string) =>
+      fetchApi<ApiResponse<FollowerImportState>>(
+        `/api/line-accounts/${id}/follower-import/start`,
+        { method: 'POST' },
+      ),
+    stepFollowerImport: (id: string) =>
+      fetchApi<ApiResponse<{ state: FollowerImportState; busy: boolean }>>(
+        `/api/line-accounts/${id}/follower-import/step`,
+        { method: 'POST' },
+      ),
   },
   conversions: {
     points: () =>
@@ -502,11 +706,24 @@ export const api = {
       fetchApi<ApiResponse<Affiliate[]>>('/api/affiliates'),
     get: (id: string) =>
       fetchApi<ApiResponse<Affiliate>>(`/api/affiliates/${id}`),
-    create: (data: { name: string; code: string; commissionRate?: number }) =>
-      fetchApi<ApiResponse<Affiliate>>('/api/affiliates', {
-        method: 'POST',
-        body: JSON.stringify(data),
-      }),
+    // Admin-side create. Codes are auto-generated (random) — no manual `code`
+    // needed. Pass `friendId` to bind 1:1 to a LINE friend; the response then
+    // includes an issued `link` (refCode + url) unless issueInitialLink=false.
+    // The legacy explicit `code` form still works for OSS back-compat.
+    create: (data: {
+      name?: string
+      code?: string
+      commissionRate?: number
+      friendId?: string
+      issueInitialLink?: boolean
+    }) =>
+      fetchApi<ApiResponse<Affiliate> & { link?: { refCode: string; url: string } | null }>(
+        '/api/affiliates',
+        {
+          method: 'POST',
+          body: JSON.stringify(data),
+        },
+      ),
     update: (id: string, data: Partial<Pick<Affiliate, 'name' | 'commissionRate' | 'isActive'>>) =>
       fetchApi<ApiResponse<Affiliate>>(`/api/affiliates/${id}`, {
         method: 'PUT',
@@ -518,6 +735,71 @@ export const api = {
       fetchApi<ApiResponse<{ affiliateId: string; affiliateName: string; code: string; commissionRate: number; totalClicks: number; totalConversions: number; totalRevenue: number }>>(
         `/api/affiliates/${id}/report?` + new URLSearchParams(params as Record<string, string>),
       ),
+    /** v2 report: clicks, friendAdds, conversionsByPoint, estimatedCommission, duplicateFlags */
+    reportV2: (id: string, params?: { startDate?: string; endDate?: string }) =>
+      fetchApi<ApiResponse<{
+        affiliateId: string;
+        affiliateName: string;
+        code: string;
+        commissionRate: number;
+        clicks: number;
+        linkClicks: number;
+        friendAdds: number;
+        conversions: number;
+        conversionsByPoint: Array<{ conversionPointId: string; name: string; count: number; value: number }>;
+        revenue: number;
+        estimatedCommission: number;
+        duplicateFlags: Array<{ friendId: string; identityKey: string }>;
+      }>>(`/api/affiliates/${id}/report?` + new URLSearchParams(params as Record<string, string>)),
+    /** Cursor-paginated attributed-friend journey summaries */
+    journeys: (id: string, params?: { limit?: number; beforeAt?: string; beforeId?: string }) => {
+      const query = new URLSearchParams();
+      if (params?.limit !== undefined) query.set('limit', String(params.limit));
+      if (params?.beforeAt) query.set('beforeAt', params.beforeAt);
+      if (params?.beforeId) query.set('beforeId', params.beforeId);
+      const qs = query.toString();
+      return fetchApi<{
+        success: boolean;
+        data: Array<{
+          friendId: string;
+          displayName: string | null;
+          addedAt: string;
+          refCode: string | null;
+          touchCount: number;
+          formCount: number;
+          conversionCount: number;
+          lastEventAt: string;
+        }>;
+        nextCursor: { beforeAt: string; beforeId: string } | null;
+      }>(`/api/affiliates/${id}/journeys${qs ? `?${qs}` : ''}`);
+    },
+    /** List ref_code links for an affiliate (loaded on detail expand) */
+    links: (id: string) =>
+      fetchApi<ApiResponse<Array<{
+        id: string;
+        affiliate_id: string;
+        ref_code: string;
+        label: string | null;
+        line_account_id: string | null;
+        is_active: number;
+        created_at: string;
+        click_count: number;
+        offer_id: string | null;
+        offer_name: string | null;
+      }>>>(`/api/affiliates/${id}/links`),
+    /** All-affiliates aggregate report (single-pass, no N+1) */
+    allReport: (params?: { startDate?: string; endDate?: string }) =>
+      fetchApi<ApiResponse<Array<{
+        affiliateId: string;
+        affiliateName: string;
+        code: string;
+        commissionRate: number;
+        totalClicks: number;
+        totalConversions: number;
+        totalRevenue: number;
+        linkCount: number;
+        friendAdds: number;
+      }>>>('/api/affiliates-report?' + new URLSearchParams(params as Record<string, string>)),
   },
   templates: {
     list: (category?: string) =>
@@ -662,12 +944,16 @@ export const api = {
       ),
   },
   chats: {
-    list: (params?: { status?: string; operatorId?: string; accountId?: string; unansweredOnly?: boolean }) => {
+    list: (params?: { status?: string; operatorId?: string; accountId?: string; unansweredOnly?: boolean; limit?: number; beforeAt?: string; beforeId?: string }) => {
       const query: Record<string, string> = {}
       if (params?.status) query.status = params.status
       if (params?.operatorId) query.operatorId = params.operatorId
       if (params?.accountId) query.lineAccountId = params.accountId
       if (params?.unansweredOnly) query.unansweredOnly = '1'
+      if (params?.limit !== undefined) query.limit = String(params.limit)
+      // カーソルページング: (lastMessageAt, friendId) の複合カーソルより古い行を返す
+      if (params?.beforeAt) query.beforeAt = params.beforeAt
+      if (params?.beforeId) query.beforeId = params.beforeId
       return fetchApi<ApiResponse<Chat[]>>(
         '/api/chats?' + new URLSearchParams(query),
       )
@@ -742,6 +1028,37 @@ export const api = {
       fetchApi<ApiResponse<{ totalScore: number; history: { id: string; scoreChange: number; reason: string | null; createdAt: string }[] }>>(
         `/api/friends/${friendId}/score`,
       ),
+  },
+  mileage: {
+    overview: (params?: { accountId?: string; search?: string; limit?: number; offset?: number }) => {
+      const query = new URLSearchParams()
+      if (params?.accountId) query.set('accountId', params.accountId)
+      if (params?.search) query.set('search', params.search)
+      if (params?.limit !== undefined) query.set('limit', String(params.limit))
+      if (params?.offset !== undefined) query.set('offset', String(params.offset))
+      const suffix = query.toString() ? `?${query.toString()}` : ''
+      return fetchApi<ApiResponse<MileageAdminOverview>>(`/api/mileage/overview${suffix}`)
+    },
+    rules: () => fetchApi<ApiResponse<MileageRule[]>>('/api/mileage/rules'),
+    createRule: (data: {
+      name: string
+      eventType: string
+      source?: string | null
+      amount: number
+      initialStatus?: 'pending' | 'available'
+      conditions?: MileageRule['conditions'] | null
+    }) => fetchApi<ApiResponse<MileageRule>>('/api/mileage/rules', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+    updateRule: (id: string, data: Partial<Pick<MileageRule,
+      'name' | 'eventType' | 'source' | 'amount' | 'initialStatus' | 'conditions' | 'isActive'
+    >>) => fetchApi<ApiResponse<MileageRule>>(`/api/mileage/rules/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+    deleteRule: (id: string) =>
+      fetchApi<ApiResponse<null>>(`/api/mileage/rules/${id}`, { method: 'DELETE' }),
   },
   webhooks: {
     incoming: {
@@ -936,6 +1253,7 @@ export const api = {
         size: 'large' | 'compact';
         defaultPageId: string | null;
         isDefaultForAll: boolean;
+        selected: boolean;
         status: 'draft' | 'published';
         publishingAt: string | null;
         thumbnailR2Key: string | null;
@@ -952,6 +1270,7 @@ export const api = {
         size: 'large' | 'compact';
         defaultPageId: string | null;
         isDefaultForAll: boolean;
+        selected: boolean;
         status: 'draft' | 'published';
         publishingAt: string | null;
         createdAt: string;
@@ -981,6 +1300,7 @@ export const api = {
       name: string;
       chatBarText: string;
       size: 'large' | 'compact';
+      selected: boolean;
       pages: Array<{
         id?: string;
         name: string;
@@ -1004,6 +1324,7 @@ export const api = {
       name?: string;
       chatBarText?: string;
       isDefaultForAll?: boolean;
+      selected?: boolean;
       pages?: Array<{
         id?: string;
         name: string;
@@ -1048,6 +1369,7 @@ export const api = {
           richMenuId: string;
           name: string;
           chatBarText: string;
+          selected: boolean;
           size: { width: number; height: number };
           areasCount: number;
           isCurrentDefault: boolean;
@@ -1156,6 +1478,30 @@ export const api = {
     funnel: (id: string) =>
       fetchApi<ApiResponse<EntryRouteFunnel>>(`/api/entry-routes/${id}/funnel`),
   },
+  // tracked_links は別管理だが /inflow-links 一覧で「(未登録)」誤表示を防ぐため
+  // 同ページから参照する。Worker の applyRefAttribution は entry_routes → tracked_links
+  // の順でフォールバックするので、tracked_links 登録済み ref は実際にはシナリオ発火している。
+  trackedLinks: {
+    list: () =>
+      fetchApi<
+        ApiResponse<
+          Array<{
+            id: string
+            name: string
+            originalUrl: string
+            trackingUrl: string
+            tagId: string | null
+            scenarioId: string | null
+            introTemplateId: string | null
+            rewardTemplateId: string | null
+            isActive: boolean
+            clickCount: number
+            createdAt: string
+            updatedAt: string
+          }>
+        >
+      >('/api/tracked-links'),
+  },
   pools: {
     list: () => fetchApi<ApiResponse<TrafficPool[]>>('/api/traffic-pools'),
     get: (id: string) => fetchApi<ApiResponse<TrafficPool>>(`/api/traffic-pools/${id}`),
@@ -1196,6 +1542,63 @@ export const api = {
           { method: 'DELETE' },
         ),
     },
+  },
+  affiliateOffers: {
+    list: (params?: { activeOnly?: boolean }) => {
+      const qs = params?.activeOnly ? '?activeOnly=true' : ''
+      return fetchApi<{ success: boolean; data: AffiliateOffer[] }>(`/api/affiliate-offers${qs}`)
+    },
+    get: (id: string) =>
+      fetchApi<{ success: boolean; data: AffiliateOffer }>(`/api/affiliate-offers/${id}`),
+    create: (data: {
+      name: string
+      description?: string | null
+      rewardAmount?: number
+      rewardMiles?: number
+      lineAccountId?: string | null
+      tagId?: string | null
+      scenarioId?: string | null
+    }) =>
+      fetchApi<{ success: boolean; data: AffiliateOffer }>('/api/affiliate-offers', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    update: (id: string, data: Partial<{
+      name: string
+      description: string | null
+      rewardAmount: number
+      rewardMiles: number
+      lineAccountId: string | null
+      tagId: string | null
+      scenarioId: string | null
+      isActive: boolean
+    }>) =>
+      fetchApi<{ success: boolean; data: AffiliateOffer }>(`/api/affiliate-offers/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+  },
+  conversionApprovals: {
+    list: (params?: { status?: 'pending' | 'approved' | 'rejected'; limit?: number; offset?: number }) => {
+      const p = new URLSearchParams()
+      if (params?.status) p.set('status', params.status)
+      if (params?.limit !== undefined) p.set('limit', String(params.limit))
+      if (params?.offset !== undefined) p.set('offset', String(params.offset))
+      const qs = p.toString()
+      return fetchApi<{ success: boolean; data: ConversionApprovalItem[] }>(
+        `/api/conversions/approvals${qs ? `?${qs}` : ''}`,
+      )
+    },
+    approve: (eventId: string) =>
+      fetchApi<{ success: boolean; data?: { id: string; approvalStatus: string }; error?: string }>(
+        `/api/conversions/events/${eventId}/approval`,
+        { method: 'PATCH', body: JSON.stringify({ status: 'approved' }) },
+      ),
+    reject: (eventId: string) =>
+      fetchApi<{ success: boolean; data?: { id: string; approvalStatus: string }; error?: string }>(
+        `/api/conversions/events/${eventId}/approval`,
+        { method: 'PATCH', body: JSON.stringify({ status: 'rejected' }) },
+      ),
   },
   duplicates: {
     stats: (options?: { forceRefresh?: boolean }) =>
@@ -1253,6 +1656,7 @@ export interface BookingMenu {
   base_price: number;
   sort_order: number;
   is_active: number;
+  auto_tag_id: string | null;
 }
 
 export interface BookingStaff {
@@ -1284,6 +1688,7 @@ export interface StaffMenuMatrix {
 
 export interface BookingRequest {
   id: string;
+  friend_id: string;
   starts_at: string;
   ends_at: string;
   status: string;
@@ -1293,6 +1698,23 @@ export interface BookingRequest {
   menu_name: string;
   staff_name: string;
   friend_name: string | null;
+}
+
+export interface BookingAvailabilityRule {
+  id: string;
+  weekday: number;
+  start_time: string;
+  end_time: string;
+  is_active: number;
+}
+
+export interface BookingGoogleCalendarConnection {
+  id: string;
+  calendar_id: string;
+  auth_type: string;
+  is_active: number;
+  last_verified_at: string | null;
+  last_error: string | null;
 }
 
 function withAccount(path: string, accountId: string): string {
@@ -1385,6 +1807,40 @@ export const bookingApi = {
       withAccount(`/api/booking/admin/staff/${staffId}/shifts/generate`, accountId),
       { method: 'POST', body: JSON.stringify(body) },
     ),
+  getAvailabilityRules: (accountId: string, staffId: string) =>
+    fetchApi<{ rules: BookingAvailabilityRule[] }>(
+      withAccount(`/api/booking/admin/staff/${staffId}/availability-rules`, accountId),
+    ),
+  putAvailabilityRules: (
+    accountId: string,
+    staffId: string,
+    rules: Array<{ weekday: number; start_time: string; end_time: string }>,
+  ) =>
+    fetchApi<{ ok: true; count: number }>(
+      withAccount(`/api/booking/admin/staff/${staffId}/availability-rules`, accountId),
+      { method: 'PUT', body: JSON.stringify({ rules }) },
+    ),
+  getGoogleCalendar: (accountId: string, staffId: string) =>
+    fetchApi<{
+      connection: BookingGoogleCalendarConnection | null;
+      service_account: { configured: boolean; email: string | null };
+      oauth: { configured: boolean };
+    }>(withAccount(`/api/booking/admin/staff/${staffId}/google-calendar`, accountId)),
+  startGoogleCalendarOAuth: (accountId: string, staffId: string) =>
+    fetchApi<{ authorization_url: string }>(
+      withAccount(`/api/booking/admin/staff/${staffId}/google-calendar/oauth/start`, accountId),
+      { method: 'POST' },
+    ),
+  putGoogleCalendar: (accountId: string, staffId: string, calendarId: string) =>
+    fetchApi<{ ok: true; calendar_id: string; last_verified_at: string }>(
+      withAccount(`/api/booking/admin/staff/${staffId}/google-calendar`, accountId),
+      { method: 'PUT', body: JSON.stringify({ calendar_id: calendarId }) },
+    ),
+  deleteGoogleCalendar: (accountId: string, staffId: string) =>
+    fetchApi<{ ok: true }>(
+      withAccount(`/api/booking/admin/staff/${staffId}/google-calendar`, accountId),
+      { method: 'DELETE' },
+    ),
   // Requests
   listRequests: (accountId: string, status: string = 'requested') =>
     fetchApi<{ requests: BookingRequest[] }>(
@@ -1449,6 +1905,11 @@ export interface EventDetail {
   reminder_hours_before: number | null;
   is_published: number;
   sort_order: number;
+  confirmation_message_extra: string | null;
+  reminder_message_extra: string | null;
+  og_title: string | null;
+  og_description: string | null;
+  og_image_url: string | null;
   // Multi-account fields (migration 040, broadcasts と同パターン)
   target_type?: 'single' | 'multi-account-dedup';
   // Worker は JSON 文字列で返す。UI 側で parse して string[] を扱う。
@@ -1581,3 +2042,132 @@ export const eventsApi = {
       withAccount('/api/events/admin/events/notifications/pending', accountId),
     ),
 };
+
+// ===== Webinars =====
+
+export type WebinarScheduleRule = {
+  type: 'daily' | 'weekly' | 'once'
+  time?: string
+  days?: number[]
+  at?: string
+}
+
+export type Webinar = {
+  id: string
+  accountId: string | null
+  title: string
+  slug: string
+  status: 'draft' | 'active' | 'archived'
+  videoPrefix: string | null
+  durationSeconds: number
+  schedule: WebinarScheduleRule[]
+  cta: { label: string; url: string; showAtSeconds: number } | null
+  tagOnAttend: string | null
+  tagOnCtaClick: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export type WebinarInput = Partial<Omit<Webinar, 'id' | 'createdAt' | 'updatedAt'>>
+
+export type WebinarSakuraComment = { id?: string; atSeconds: number; authorName: string; body: string }
+
+export type WebinarAnalytics = {
+  summary: {
+    reservations: number
+    viewers: number
+    registeredAndJoined: number
+    watched5m: number
+    watched15m: number
+    completed: number
+    avgWatchedSeconds: number
+    ctaClicks: number
+    formSubmissions: number
+  }
+  daily: Array<{
+    date: string
+    reservations: number
+    viewers: number
+    ctaClicks: number
+    formSubmissions: number
+  }>
+  participants: Array<{
+    friendId: string
+    friendName: string | null
+    pictureUrl: string | null
+    sessions: number
+    firstJoinedAt: string
+    latestJoinedAt: string
+    latestWatchedSeconds?: number
+    /** 旧Worker/旧管理画面とのローリングデプロイ互換。 */
+    maxWatchedSeconds?: number
+    ctaClickedAt: string | null
+    registered: boolean
+    formSubmittedAt: string | null
+  }>
+  sessions: Array<{ sessionStartAt: number; viewers: number; avgWatchedSeconds: number; ctaClicks: number }>
+  dropoff: Array<{ bucketStart: number; viewers: number }>
+  formFunnel: {
+    ctaImpressions: number
+    ctaClicks: number
+    formOpens: number
+    formStarts: number
+    submitAttempts: number
+    submitSuccesses: number
+    submitErrors: number
+    fieldCompletions: Array<{ fieldName: string; users: number }>
+  }
+}
+
+export type WebinarUserComment = {
+  id: string
+  friendId: string
+  friendName: string | null
+  pictureUrl: string | null
+  sessionStartAt: number
+  atSeconds: number
+  body: string
+  createdAt: string
+}
+
+export type WebinarCtaCard = {
+  id?: string
+  atSeconds: number
+  kind: 'form' | 'url'
+  title: string
+  body: string | null
+  buttonLabel: string
+  autoOpen: boolean
+  formId: string | null
+  url: string | null
+}
+
+export const webinarApi = {
+  list: () => fetchApi<{ data: Webinar[] }>('/api/webinars'),
+  get: (id: string) => fetchApi<{ data: Webinar }>(`/api/webinars/${id}`),
+  create: (input: WebinarInput) =>
+    fetchApi<{ data: Webinar }>('/api/webinars', { method: 'POST', body: JSON.stringify(input) }),
+  update: (id: string, input: WebinarInput) =>
+    fetchApi<{ data: Webinar }>(`/api/webinars/${id}`, { method: 'PUT', body: JSON.stringify(input) }),
+  remove: (id: string) => fetchApi<{ data: null }>(`/api/webinars/${id}`, { method: 'DELETE' }),
+  comments: (id: string) =>
+    fetchApi<{ data: WebinarSakuraComment[] }>(`/api/webinars/${id}/comments`),
+  saveComments: (id: string, comments: WebinarSakuraComment[]) =>
+    fetchApi<{ data: { count: number } }>(`/api/webinars/${id}/comments`, {
+      method: 'PUT',
+      body: JSON.stringify({ comments: comments.map(({ atSeconds, authorName, body }) => ({ atSeconds, authorName, body })) }),
+    }),
+  ctas: (id: string) => fetchApi<{ data: WebinarCtaCard[] }>(`/api/webinars/${id}/ctas`),
+  saveCtas: (id: string, ctas: WebinarCtaCard[]) =>
+    fetchApi<{ data: { count: number } }>(`/api/webinars/${id}/ctas`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        ctas: ctas.map(({ atSeconds, kind, title, body, buttonLabel, autoOpen, formId, url }) => ({
+          atSeconds, kind, title, body, buttonLabel, autoOpen, formId, url,
+        })),
+      }),
+    }),
+  analytics: (id: string) => fetchApi<{ data: WebinarAnalytics }>(`/api/webinars/${id}/analytics`),
+  userComments: (id: string) =>
+    fetchApi<{ data: WebinarUserComment[] }>(`/api/webinars/${id}/user-comments`),
+}
