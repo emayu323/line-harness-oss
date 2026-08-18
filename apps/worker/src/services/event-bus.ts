@@ -205,15 +205,16 @@ function matchConditions(
     if (payload.eventData.tagId !== conditions.tag_id) return false;
   }
 
-  // keyword チェック（message_received イベント用）
+  // keyword チェック（message_received / postback_received イベント用）
   if (conditions.keyword !== undefined && payload.eventData) {
     const text = payload.eventData.text as string | undefined;
     if (!text || !text.includes(conditions.keyword as string)) return false;
   }
 
   // keyword_exact（完全一致）
-  if (typeof conditions.keyword_exact === 'string') {
-    const text = typeof payload.eventData?.text === 'string' ? payload.eventData.text.trim() : '';
+  if (conditions.keyword_exact) {
+    const rawText = payload.eventData?.text as string | undefined;
+    const text = (rawText || '').trim();
     if (text !== conditions.keyword_exact) {
       return false;
     }
@@ -383,7 +384,7 @@ async function executeAction(
           .replace(/\r/g, '\\r')
           .replace(/\t/g, '\\t')
           .replace(/[\u0000-\u001f]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
-      const messageText = typeof payload.eventData?.text === 'string' ? payload.eventData.text : '';
+      const messageText = (payload.eventData?.text as string | undefined) || '';
       const raw = (action.params.data || '{}')
         .replace(/\{\{message\}\}/g, escapeForJsonString(messageText));
       const patch = JSON.parse(raw) as Record<string, unknown>;
@@ -401,7 +402,7 @@ async function executeAction(
 }
 
 /** 送信メッセージを messages_log に記録（失敗しても例外を上げない） */
-async function logOutgoingMessage(
+export async function logOutgoingMessage(
   db: D1Database,
   params: {
     friendId: string;
