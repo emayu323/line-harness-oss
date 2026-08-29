@@ -1,12 +1,13 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
+import Link from 'next/link'
 import { api } from '@/lib/api'
 import { useAccount } from '@/contexts/account-context'
 import Header from '@/components/layout/header'
 import CcPromptButton from '@/components/cc-prompt-button'
 
-type AutomationEventType = "friend_add" | "tag_change" | "score_threshold" | "cv_fire" | "message_received" | "calendar_booked"
+type AutomationEventType = "friend_add" | "tag_change" | "score_threshold" | "cv_fire" | "message_received" | "postback_received" | "calendar_booked"
 
 interface AutomationAction {
   type: "add_tag" | "remove_tag" | "start_scenario" | "send_message" | "send_webhook" | "switch_rich_menu"
@@ -22,6 +23,9 @@ interface Automation {
   actions: AutomationAction[]
   isActive: boolean
   priority: number
+  // null = global automation (fires for every account); UUID = bound to that
+  // account. Surfaced so the badge + toggle/delete guards can distinguish.
+  lineAccountId: string | null
   createdAt: string
   updatedAt: string
 }
@@ -32,6 +36,7 @@ const eventTypeOptions: { value: AutomationEventType; label: string }[] = [
   { value: 'score_threshold', label: 'スコア閾値' },
   { value: 'cv_fire', label: 'CV発火' },
   { value: 'message_received', label: 'メッセージ受信' },
+  { value: 'postback_received', label: 'ポストバック受信（リッチメニュー等）' },
   { value: 'calendar_booked', label: 'カレンダー予約' },
 ]
 
@@ -41,6 +46,7 @@ const eventTypeLabelMap: Record<AutomationEventType, string> = {
   score_threshold: 'スコア閾値',
   cv_fire: 'CV発火',
   message_received: 'メッセージ受信',
+  postback_received: 'ポストバック受信',
   calendar_booked: 'カレンダー予約',
 }
 
@@ -50,6 +56,7 @@ const eventTypeBadgeColor: Record<AutomationEventType, string> = {
   score_threshold: 'bg-yellow-100 text-yellow-700',
   cv_fire: 'bg-red-100 text-red-700',
   message_received: 'bg-purple-100 text-purple-700',
+  postback_received: 'bg-pink-100 text-pink-700',
   calendar_booked: 'bg-indigo-100 text-indigo-700',
 }
 
@@ -197,6 +204,15 @@ export default function AutomationsPage() {
   }
 
   const handleToggleActive = async (id: string, current: boolean) => {
+    // Globals fire for every account; flipping one from an account-scoped view
+    // would silently affect all accounts, so warn first.
+    const target = automations.find((a) => a.id === id)
+    if (target?.lineAccountId === null) {
+      const ok = confirm(
+        `「${target.name}」は全アカウント共通のオートメーションです。${current ? '無効化' : '有効化'}するとすべてのアカウントに影響します。続行しますか?`,
+      )
+      if (!ok) return
+    }
     try {
       await api.automations.update(id, { isActive: !current })
       loadAutomations()
@@ -206,7 +222,11 @@ export default function AutomationsPage() {
   }
 
   const handleDelete = async (id: string) => {
-    if (!confirm('このオートメーションを削除してもよいですか？')) return
+    const target = automations.find((a) => a.id === id)
+    const message = target?.lineAccountId === null
+      ? `「${target.name}」は全アカウント共通のオートメーションです。削除するとすべてのアカウントから消えます。本当に削除しますか?`
+      : 'このオートメーションを削除してもよいですか？'
+    if (!confirm(message)) return
     try {
       await api.automations.delete(id)
       loadAutomations()
@@ -384,6 +404,16 @@ export default function AutomationsPage() {
                 }`}>
                   {automation.isActive ? '有効' : '無効'}
                 </span>
+                {/* lineAccountId === null = global; label it so the account-scoped
+                   list cannot disguise an all-accounts rule as account-local. */}
+                {automation.lineAccountId === null && (
+                  <span
+                    className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-amber-50 text-amber-700 border border-amber-200"
+                    title="全アカウントに適用されるオートメーションです"
+                  >
+                    全アカウント共通
+                  </span>
+                )}
               </div>
 
               {/* Meta info */}
@@ -395,9 +425,9 @@ export default function AutomationsPage() {
                   <div className="flex items-center gap-4 text-xs text-gray-400 mb-3">
                     <span>アクション: {automation.actions.length}件</span>
                     {sendMsgWithTpl > 0 && (
-                      <a href="/templates" className="text-blue-600 hover:underline" title="template_id 参照を含む send_message action あり">
+                      <Link href="/templates" className="text-blue-600 hover:underline" title="template_id 参照を含む send_message action あり">
                         🔗 template×{sendMsgWithTpl}
-                      </a>
+                      </Link>
                     )}
                     <span>優先度: {automation.priority}</span>
                   </div>
