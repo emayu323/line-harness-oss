@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { LineClient } from '@line-crm/line-sdk';
-import { getFriendById, getLineAccountById } from '@line-crm/db';
+import { getFriendById, getLineAccountById, resolveDefaultAccessToken } from '@line-crm/db';
 import type { Env } from '../index.js';
 
 const richMenus = new Hono<Env>();
@@ -12,7 +12,7 @@ async function resolveLineClient(c: { env: Env['Bindings']; req: { query(key: st
     const account = await getLineAccountById(c.env.DB, accountId);
     if (account) return new LineClient(account.channel_access_token);
   }
-  return new LineClient(c.env.LINE_CHANNEL_ACCESS_TOKEN);
+  return new LineClient(await resolveDefaultAccessToken(c.env.DB, c.env.LINE_CHANNEL_ACCESS_TOKEN));
 }
 
 // GET /api/rich-menus — list all rich menus from LINE API
@@ -86,7 +86,7 @@ richMenus.post('/api/friends/:friendId/rich-menu', async (c) => {
       return c.json({ success: false, error: 'Friend not found' }, 404);
     }
 
-    let accessToken = c.env.LINE_CHANNEL_ACCESS_TOKEN;
+    let accessToken = await resolveDefaultAccessToken(db, c.env.LINE_CHANNEL_ACCESS_TOKEN);
     const friendAccountId = (friend as unknown as Record<string, string | null>).line_account_id;
     if (friendAccountId) {
       const account = await getLineAccountById(db, friendAccountId);
@@ -114,7 +114,7 @@ richMenus.delete('/api/friends/:friendId/rich-menu', async (c) => {
       return c.json({ success: false, error: 'Friend not found' }, 404);
     }
 
-    let accessToken = c.env.LINE_CHANNEL_ACCESS_TOKEN;
+    let accessToken = await resolveDefaultAccessToken(db, c.env.LINE_CHANNEL_ACCESS_TOKEN);
     const friendAccId = (friend as unknown as Record<string, string | null>).line_account_id;
     if (friendAccId) {
       const account = await getLineAccountById(c.env.DB, friendAccId);
@@ -142,7 +142,7 @@ richMenus.get('/api/friends/:friendId/rich-menu', async (c) => {
       return c.json({ success: false, error: 'Friend not found' }, 404);
     }
 
-    let accessToken = c.env.LINE_CHANNEL_ACCESS_TOKEN;
+    let accessToken = await resolveDefaultAccessToken(db, c.env.LINE_CHANNEL_ACCESS_TOKEN);
     const friendAccId = (friend as unknown as Record<string, string | null>).line_account_id;
     if (friendAccId) {
       const account = await getLineAccountById(db, friendAccId);
@@ -211,12 +211,13 @@ richMenus.post('/api/rich-menus/:id/image', async (c) => {
 
     if (contentType.includes('application/json')) {
       // Accept base64 encoded image in JSON body
-      const body = await c.req.json<{ image: string; contentType?: string }>();
-      if (!body.image) {
+      const body = await c.req.json<{ image?: string; imageData?: string; contentType?: string }>();
+      const imageBase64 = body.image ?? body.imageData;
+      if (!imageBase64) {
         return c.json({ success: false, error: 'image (base64) is required' }, 400);
       }
       // Strip data URI prefix if present
-      const base64 = body.image.replace(/^data:image\/\w+;base64,/, '');
+      const base64 = imageBase64.replace(/^data:image\/\w+;base64,/, '');
       const binaryString = atob(base64);
       const bytes = new Uint8Array(binaryString.length);
       for (let i = 0; i < binaryString.length; i++) {
