@@ -1,4 +1,5 @@
 import { jstNow } from './utils.js';
+import { resolveAffiliateAttribution } from './affiliate-attribution.js';
 // =============================================================================
 // Conversion Points & Events — CV Tracking
 // =============================================================================
@@ -19,6 +20,11 @@ export interface ConversionEvent {
   affiliate_code: string | null;
   metadata: string | null;
   created_at: string;
+  affiliate_id: string | null;
+  attributed_ref_code: string | null;
+  /** Approval state for affiliate-attributed CVs (ASP Phase 2). NULL if non-attributed. */
+  approval_status: 'pending' | 'approved' | 'rejected' | null;
+  approved_at: string | null;
 }
 
 // ── Conversion Points CRUD ──────────────────────────────────────────────────
@@ -79,19 +85,32 @@ export interface TrackConversionInput {
   userId?: string | null;
   affiliateCode?: string | null;
   metadata?: string | null;
+  /**
+   * Caller-chosen event ID for idempotent ingestion. When set, a second call
+   * with the same ID records nothing and returns the existing event. Omit it
+   * for the default behavior (a new random ID per call).
+   */
+  id?: string;
 }
 
 export async function trackConversion(
   db: D1Database,
   input: TrackConversionInput,
 ): Promise<ConversionEvent> {
-  const id = crypto.randomUUID();
+  const id = input.id ?? crypto.randomUUID();
   const now = jstNow();
+
+  // Resolve last-touch affiliate attribution before inserting the event.
+  const attr = await resolveAffiliateAttribution(db, input.friendId);
+
+  // Affiliate-attributed CVs enter the approval queue as 'pending'; non-attributed
+  // CVs leave approval_status NULL (the approval flow only applies to attributed rows).
+  const approvalStatus = attr ? 'pending' : null;
 
   await db
     .prepare(
-      `INSERT INTO conversion_events (id, conversion_point_id, friend_id, user_id, affiliate_code, metadata, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT ${input.id ? 'OR IGNORE ' : ''}INTO conversion_events (id, conversion_point_id, friend_id, user_id, affiliate_code, metadata, created_at, affiliate_id, attributed_ref_code, approval_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       id,
@@ -101,6 +120,9 @@ export async function trackConversion(
       input.affiliateCode ?? null,
       input.metadata ?? null,
       now,
+      attr?.affiliateId ?? null,
+      attr?.refCode ?? null,
+      approvalStatus,
     )
     .run();
 
