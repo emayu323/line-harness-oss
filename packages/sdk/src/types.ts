@@ -37,6 +37,8 @@ export interface Friend {
   isFollowing: boolean
   metadata: Record<string, unknown>
   tags: Tag[]
+  /** 所属する LINE アカウント (multi-account 環境)。 */
+  lineAccountId?: string | null
   createdAt: string
   updatedAt: string
 }
@@ -46,8 +48,33 @@ export interface FriendListParams {
   offset?: number
   tagId?: string
   search?: string
+  /** Exact LINE user ID match. Requires an account (accountId or the client default). */
+  lineUserId?: string
   metadata?: Record<string, string>
   accountId?: string
+}
+
+// ─── Conversion ─────────────────────────────────────────
+export interface ConversionEvent {
+  id: string
+  conversionPointId: string
+  friendId: string
+  userId: string | null
+  affiliateCode: string | null
+  metadata: string | null
+  createdAt: string
+}
+
+export interface TrackConversionInput {
+  conversionPointId: string
+  friendId: string
+  userId?: string | null
+  affiliateCode?: string | null
+  metadata?: Record<string, unknown> | null
+  /** Also fire `cv_fire`. Requires `idempotencyKey`. */
+  fireEvent?: boolean
+  /** DB-wide key retained indefinitely; namespace by integration/account. A retry returns the same event. */
+  idempotencyKey?: string
 }
 
 // ─── Tag ────────────────────────────────────────────────
@@ -226,6 +253,8 @@ export interface Broadcast {
   successCount: number
   lineRequestId?: string | null
   aggregationUnit?: string | null
+  /** リンク自動短縮 (auto-track) の ON/OFF。false なら URL をそのまま送信する。 */
+  trackLinks?: boolean
   createdAt: string
 }
 
@@ -256,6 +285,8 @@ export interface CreateBroadcastInput {
   targetTagId?: string
   scheduledAt?: string
   altText?: string
+  /** false でリンク自動短縮 (auto-track) を無効化し、URL をそのまま送信する。省略時は true。 */
+  trackLinks?: boolean
 }
 
 export interface UpdateBroadcastInput {
@@ -265,6 +296,7 @@ export interface UpdateBroadcastInput {
   targetType?: 'all' | 'tag'
   targetTagId?: string | null
   scheduledAt?: string | null
+  trackLinks?: boolean
 }
 
 // ─── Rich Menu ──────────────────────────────────────────
@@ -321,12 +353,18 @@ export interface TrackedLink {
   name: string
   originalUrl: string
   trackingUrl: string
+  /** 7文字の短縮コード（/t/<code>）。旧リンクは null（UUID URL のみ）。 */
+  shortCode?: string | null
   tagId: string | null
   scenarioId: string | null
   introTemplateId: string | null
   rewardTemplateId: string | null
+  lineAccountId: string | null
   isActive: boolean
   clickCount: number
+  ogTitle: string | null
+  ogDescription: string | null
+  ogImageUrl: string | null
   createdAt: string
   updatedAt: string
 }
@@ -349,6 +387,11 @@ export interface CreateTrackedLinkInput {
   scenarioId?: string | null
   introTemplateId?: string | null
   rewardTemplateId?: string | null
+  /** リンクを所有する LINE アカウント。/t の LIFF リダイレクト先の解決に使う。 */
+  lineAccountId?: string | null
+  ogTitle?: string | null
+  ogDescription?: string | null
+  ogImageUrl?: string | null
 }
 
 export interface UpdateTrackedLinkInput {
@@ -357,7 +400,11 @@ export interface UpdateTrackedLinkInput {
   scenarioId?: string | null
   introTemplateId?: string | null
   rewardTemplateId?: string | null
+  lineAccountId?: string | null
   isActive?: boolean
+  ogTitle?: string | null
+  ogDescription?: string | null
+  ogImageUrl?: string | null
 }
 
 // ─── Forms ──────────────────────────────────────────────
@@ -382,6 +429,9 @@ export interface Form {
   saveToMetadata: boolean
   isActive: boolean
   submitCount: number
+  ogTitle: string | null
+  ogDescription: string | null
+  ogImageUrl: string | null
   createdAt: string
   updatedAt: string
 }
@@ -395,6 +445,9 @@ export interface CreateFormInput {
   onSubmitMessageType?: 'text' | 'flex' | null
   onSubmitMessageContent?: string | null
   saveToMetadata?: boolean
+  ogTitle?: string | null
+  ogDescription?: string | null
+  ogImageUrl?: string | null
 }
 
 export interface UpdateFormInput {
@@ -407,6 +460,9 @@ export interface UpdateFormInput {
   onSubmitMessageContent?: string | null
   saveToMetadata?: boolean
   isActive?: boolean
+  ogTitle?: string | null
+  ogDescription?: string | null
+  ogImageUrl?: string | null
 }
 
 export interface FormSubmission {
@@ -476,7 +532,10 @@ export interface CalendarBooking {
 // ─── Staff ──────────────────────────────────────────────
 export type StaffRole = 'owner' | 'admin' | 'staff'
 
+export type StaffApiScope = 'messages:read' | 'messages:send'
+
 export interface StaffMember {
+  apiScopes?: StaffApiScope[] | null
   id: string
   name: string
   email: string | null
@@ -499,12 +558,14 @@ export interface StaffProfile {
 }
 
 export interface CreateStaffInput {
+  apiScopes?: StaffApiScope[] | null
   name: string
   email?: string
   role: 'admin' | 'staff'
 }
 
 export interface UpdateStaffInput {
+  apiScopes?: StaffApiScope[] | null
   name?: string
   email?: string | null
   role?: StaffRole
