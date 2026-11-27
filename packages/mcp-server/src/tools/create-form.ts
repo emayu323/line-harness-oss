@@ -41,7 +41,11 @@ export function registerCreateForm(server: McpServer): void {
         .string()
         .optional()
         .describe("LINE account ID (uses default if omitted)"),
+      ogTitle: z.string().nullable().optional().describe("OGP title override for the form's LIFF page preview"),
+      ogDescription: z.string().nullable().optional().describe("OGP description override for the form's LIFF page preview"),
+      ogImageUrl: z.string().nullable().optional().describe("OGP image URL override for the form's LIFF page preview"),
     },
+    { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     async ({
       name,
       description,
@@ -51,6 +55,9 @@ export function registerCreateForm(server: McpServer): void {
       onSubmitMessageType,
       onSubmitMessageContent,
       saveToMetadata,
+      ogTitle,
+      ogDescription,
+      ogImageUrl,
     }) => {
       try {
         const client = getClient();
@@ -63,6 +70,9 @@ export function registerCreateForm(server: McpServer): void {
           onSubmitMessageType,
           onSubmitMessageContent,
           saveToMetadata,
+          ogTitle,
+          ogDescription,
+          ogImageUrl,
         });
         return {
           content: [

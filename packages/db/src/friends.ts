@@ -6,6 +6,11 @@ export interface Friend {
   picture_url: string | null;
   status_message: string | null;
   is_following: number;
+  first_followed_at?: string | null;
+  current_follow_started_at?: string | null;
+  last_followed_at?: string | null;
+  last_unfollowed_at?: string | null;
+  unfollow_count?: number;
   user_id: string | null;
   line_account_id: string | null;
   metadata: string;
@@ -90,6 +95,27 @@ export async function getFollowingLineUserIdsByTag(
   return (result.results ?? []).map((r) => r.line_user_id);
 }
 
+/**
+ * アカウントスコープ優先の friend 解決。同一プロバイダー配下の複数アカウント
+ * では line_user_id が同一になるため、無指定の先頭一致だと別アカウントの
+ * friend 行に吸われて通知アカウントがズレる。指定アカウントの行を優先し、
+ * 無ければ従来どおり先頭一致にフォールバックする。
+ */
+export async function getFriendByLineUserIdForAccount(
+  db: D1Database,
+  lineUserId: string,
+  lineAccountId: string | null,
+): Promise<Friend | null> {
+  if (lineAccountId) {
+    const scoped = await db
+      .prepare(`SELECT * FROM friends WHERE line_user_id = ? AND line_account_id = ?`)
+      .bind(lineUserId, lineAccountId)
+      .first<Friend>();
+    if (scoped) return scoped;
+  }
+  return getFriendByLineUserId(db, lineUserId);
+}
+
 export async function getFriendByLineUserId(
   db: D1Database,
   lineUserId: string,
@@ -139,43 +165,41 @@ export interface UpsertFriendInput {
   displayName?: string | null;
   pictureUrl?: string | null;
   statusMessage?: string | null;
+  /**
+   * LINE account the friend belongs to. Written by the same statement that
+   * creates/updates the row, so a friend is never committed without its
+   * account even if the caller is cut off right after (e.g. an isolate killed
+   * mid-burst, 2026-11-23). Omit/null to leave attribution untouched.
+   */
+  lineAccountId?: string | null;
+  /**
+   * How `lineAccountId` applies to an EXISTING row (new rows always get it):
+   * - 'fill' (default): set only while the row has no account yet.
+   * - 'rebind': overwrite — a follow event proves the user now follows it.
+   */
+  accountMode?: 'fill' | 'rebind';
 }
 
 export async function upsertFriend(
   db: D1Database,
   input: UpsertFriendInput,
 ): Promise<Friend> {
-  const now = jstNow();
   const existing = await getFriendByLineUserId(db, input.lineUserId);
+  if (existing) return updateFriendOnUpsert(db, input, existing);
 
-  if (existing) {
-    await db
-      .prepare(
-        `UPDATE friends
-         SET display_name = ?,
-             picture_url = ?,
-             status_message = ?,
-             is_following = 1,
-             updated_at = ?
-         WHERE line_user_id = ?`,
-      )
-      .bind(
-        'displayName' in input ? (input.displayName ?? null) : existing.display_name,
-        'pictureUrl' in input ? (input.pictureUrl ?? null) : existing.picture_url,
-        'statusMessage' in input ? (input.statusMessage ?? null) : existing.status_message,
-        now,
-        input.lineUserId,
-      )
-      .run();
-
-    return (await getFriendByLineUserId(db, input.lineUserId))!;
-  }
-
+  const now = jstNow();
   const id = crypto.randomUUID();
-  await db
+  // /auth/callback and the follow webhook routinely create the same friend at
+  // the same moment. A plain INSERT made the loser throw a UNIQUE violation
+  // and abort before attributing the account; fall back to the update path.
+  const inserted = await db
     .prepare(
-      `INSERT INTO friends (id, line_user_id, display_name, picture_url, status_message, is_following, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 1, ?, ?)`,
+      `INSERT INTO friends
+         (id, line_user_id, display_name, picture_url, status_message, is_following,
+          line_account_id, first_followed_at, current_follow_started_at, last_followed_at,
+          created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(line_user_id) DO NOTHING`,
     )
     .bind(
       id,
@@ -183,12 +207,66 @@ export async function upsertFriend(
       input.displayName ?? null,
       input.pictureUrl ?? null,
       input.statusMessage ?? null,
+      input.lineAccountId ?? null,
+      now,
+      now,
+      now,
       now,
       now,
     )
     .run();
 
+  if (inserted.meta?.changes === 0) {
+    const winner = await getFriendByLineUserId(db, input.lineUserId);
+    if (winner) return updateFriendOnUpsert(db, input, winner);
+  }
+
   return (await getFriendById(db, id))!;
+}
+
+async function updateFriendOnUpsert(
+  db: D1Database,
+  input: UpsertFriendInput,
+  existing: Friend,
+): Promise<Friend> {
+  const now = jstNow();
+  const accountSql =
+    input.accountMode === 'rebind'
+      ? 'COALESCE(?, line_account_id)'
+      : 'COALESCE(line_account_id, ?)';
+  await db
+    .prepare(
+      `UPDATE friends
+       SET display_name = ?,
+           picture_url = ?,
+           status_message = ?,
+           line_account_id = ${accountSql},
+           first_followed_at = COALESCE(first_followed_at, created_at),
+           current_follow_started_at = CASE
+             WHEN is_following = 0 OR current_follow_started_at IS NULL THEN ?
+             ELSE current_follow_started_at
+           END,
+           last_followed_at = CASE
+             WHEN is_following = 0 THEN ?
+             ELSE COALESCE(last_followed_at, created_at)
+           END,
+           is_following = 1,
+           updated_at = ?
+       WHERE line_user_id = ?`,
+    )
+    .bind(
+      'displayName' in input ? (input.displayName ?? null) : existing.display_name,
+      'pictureUrl' in input ? (input.pictureUrl ?? null) : existing.picture_url,
+      'statusMessage' in input ? (input.statusMessage ?? null) : existing.status_message,
+      input.lineAccountId ?? null,
+      now,
+      now,
+      now,
+      input.lineUserId,
+    )
+    .run();
+
+  return (await getFriendByLineUserId(db, input.lineUserId))!;
 }
 
 export async function updateFriendFollowStatus(
@@ -196,13 +274,35 @@ export async function updateFriendFollowStatus(
   lineUserId: string,
   isFollowing: boolean,
 ): Promise<void> {
+  const now = jstNow();
+  if (isFollowing) {
+    await db
+      .prepare(
+        `UPDATE friends
+            SET first_followed_at = COALESCE(first_followed_at, created_at),
+                current_follow_started_at = CASE
+                  WHEN is_following = 0 OR current_follow_started_at IS NULL THEN ?
+                  ELSE current_follow_started_at
+                END,
+                last_followed_at = CASE WHEN is_following = 0 THEN ? ELSE last_followed_at END,
+                is_following = 1, updated_at = ?
+          WHERE line_user_id = ?`,
+      )
+      .bind(now, now, now, lineUserId)
+      .run();
+    return;
+  }
   await db
     .prepare(
       `UPDATE friends
-       SET is_following = ?, updated_at = ?
-       WHERE line_user_id = ?`,
+          SET is_following = 0,
+              current_follow_started_at = NULL,
+              last_unfollowed_at = CASE WHEN is_following = 1 THEN ? ELSE last_unfollowed_at END,
+              unfollow_count = unfollow_count + CASE WHEN is_following = 1 THEN 1 ELSE 0 END,
+              updated_at = ?
+        WHERE line_user_id = ?`,
     )
-    .bind(isFollowing ? 1 : 0, jstNow(), lineUserId)
+    .bind(now, now, lineUserId)
     .run();
 }
 
@@ -212,7 +312,11 @@ export async function getMergedMetadataByUserId(
   userId: string,
 ): Promise<Record<string, unknown>> {
   const result = await db
-    .prepare(`SELECT metadata FROM friends WHERE user_id = ? AND metadata IS NOT NULL AND metadata != '{}'`)
+    .prepare(
+      `SELECT metadata FROM friends
+       WHERE user_id = ? AND metadata IS NOT NULL AND metadata != '{}'
+       ORDER BY updated_at DESC`,
+    )
     .bind(userId)
     .all<{ metadata: string }>();
   const merged: Record<string, unknown> = {};
