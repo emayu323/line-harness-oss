@@ -1,3 +1,5 @@
+import { createAuthorizedRouter } from '../middleware/authorized-router.js';
+import { checkWebhookActions } from '../lib/outbound-url.js';
 import { Hono } from 'hono';
 import {
   getAutomations,
@@ -9,7 +11,7 @@ import {
 } from '@line-crm/db';
 import type { Env } from '../index.js';
 
-const automations = new Hono<Env>();
+const automations = createAuthorizedRouter<Env>();
 
 // ========== 自動化ルールCRUD ==========
 
@@ -18,6 +20,8 @@ automations.get('/api/automations', async (c) => {
     const lineAccountId = c.req.query('lineAccountId');
     let items;
     if (lineAccountId) {
+      // NULL line_account_id = global automation (event-bus.ts:149 fires it for every account).
+      // Include both account-bound and global rows so the UI mirrors the engine's match semantic.
       const result = await c.env.DB
         .prepare(`SELECT * FROM automations WHERE line_account_id IS NULL OR line_account_id = ? ORDER BY priority DESC, created_at DESC`)
         .bind(lineAccountId)
@@ -35,9 +39,12 @@ automations.get('/api/automations', async (c) => {
         eventType: a.event_type,
         conditions: JSON.parse(a.conditions),
         actions: JSON.parse(a.actions),
-        lineAccountId: (a as { line_account_id?: string | null }).line_account_id ?? null,
         isActive: Boolean(a.is_active),
         priority: a.priority,
+        // null line_account_id = global automation. Surfacing this lets callers
+        // distinguish globals from account-bound rows in the mixed result and
+        // avoid unintentionally editing a rule that affects every account.
+        lineAccountId: a.line_account_id ?? null,
         createdAt: a.created_at,
         updatedAt: a.updated_at,
       })),
@@ -67,6 +74,7 @@ automations.get('/api/automations/:id', async (c) => {
         actions: JSON.parse(item.actions),
         isActive: Boolean(item.is_active),
         priority: item.priority,
+        lineAccountId: item.line_account_id ?? null,
         createdAt: item.created_at,
         updatedAt: item.updated_at,
         logs: logs.map((l) => ({
@@ -99,14 +107,21 @@ automations.post('/api/automations', async (c) => {
     if (!body.name || !body.eventType || !body.actions) {
       return c.json({ success: false, error: 'name, eventType, actions are required' }, 400);
     }
-    const item = await createAutomation(c.env.DB, body);
+    const urlCheck = checkWebhookActions(body.actions, { ...c.env, REQUEST_ORIGIN: new URL(c.req.url).origin });
+    if (!urlCheck.allowed) return c.json({ success: false, error: 'webhook_url_invalid', reason: urlCheck.warnings[0] }, 400);
+    let item = await createAutomation(c.env.DB, body);
     // Save line_account_id if provided
     if (body.lineAccountId) {
       await c.env.DB.prepare(`UPDATE automations SET line_account_id = ? WHERE id = ?`)
         .bind(body.lineAccountId, item.id).run();
+      // Re-read so the response reports the persisted scope; the createAutomation
+      // helper does not accept line_account_id, so item still has the pre-UPDATE value.
+      const refreshed = await getAutomationById(c.env.DB, item.id);
+      if (refreshed) item = refreshed;
     }
     return c.json({
       success: true,
+      ...(urlCheck.warnings.length ? { warnings: urlCheck.warnings } : {}),
       data: {
         id: item.id,
         name: item.name,
@@ -114,6 +129,7 @@ automations.post('/api/automations', async (c) => {
         actions: JSON.parse(item.actions),
         isActive: Boolean(item.is_active),
         priority: item.priority,
+        lineAccountId: item.line_account_id ?? null,
         createdAt: item.created_at,
       },
     }, 201);
@@ -127,11 +143,20 @@ automations.put('/api/automations/:id', async (c) => {
   try {
     const id = c.req.param('id');
     const body = await c.req.json();
+    let actions = body.actions;
+    if (actions === undefined && body.isActive === true) {
+      const existing = await getAutomationById(c.env.DB, id);
+      if (!existing) return c.json({ success: false, error: 'Not found' }, 404);
+      actions = JSON.parse(existing.actions);
+    }
+    const urlCheck = actions === undefined ? { allowed: true, warnings: [] } : checkWebhookActions(actions, { ...c.env, REQUEST_ORIGIN: new URL(c.req.url).origin });
+    if (!urlCheck.allowed) return c.json({ success: false, error: 'webhook_url_invalid', reason: urlCheck.warnings[0] }, 400);
     await updateAutomation(c.env.DB, id, body);
     const updated = await getAutomationById(c.env.DB, id);
     if (!updated) return c.json({ success: false, error: 'Not found' }, 404);
     return c.json({
       success: true,
+      ...(urlCheck.warnings.length ? { warnings: urlCheck.warnings } : {}),
       data: {
         id: updated.id,
         name: updated.name,
@@ -140,6 +165,7 @@ automations.put('/api/automations/:id', async (c) => {
         actions: JSON.parse(updated.actions),
         isActive: Boolean(updated.is_active),
         priority: updated.priority,
+        lineAccountId: updated.line_account_id ?? null,
       },
     });
   } catch (err) {
