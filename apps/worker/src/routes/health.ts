@@ -1,3 +1,4 @@
+import { createAuthorizedRouter } from '../middleware/authorized-router.js';
 import { Hono } from 'hono';
 import {
   getAccountHealthLogs,
@@ -9,7 +10,18 @@ import {
 } from '@line-crm/db';
 import type { Env } from '../index.js';
 
-const health = new Hono<Env>();
+const health = createAuthorizedRouter<Env>();
+
+// ========== Liveness ==========
+// Public (no auth, see middleware/auth.ts skip list): probed by
+// `create-line-harness update` and by the self-update verify phase
+// (capabilities advertises `/api/health`). Deliberately dependency-free —
+// it exists only to prove the Worker booted and is routing requests.
+
+const LIVENESS_BODY = { success: true, data: { status: 'ok' } } as const;
+
+health.get('/health', (c) => c.json(LIVENESS_BODY));
+health.get('/api/health', (c) => c.json(LIVENESS_BODY));
 
 // ========== アカウントヘルス ==========
 

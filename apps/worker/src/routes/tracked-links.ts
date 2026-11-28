@@ -1,7 +1,9 @@
+import { createAuthorizedRouter } from '../middleware/authorized-router.js';
 import { Hono } from 'hono';
 import {
   getTrackedLinks,
   getTrackedLinkById,
+  getTrackedLinkByIdOrShortCode,
   createTrackedLink,
   updateTrackedLink,
   deleteTrackedLink,
@@ -9,25 +11,48 @@ import {
   getLinkClicks,
   getFriendByLineUserId,
 } from '@line-crm/db';
-import { addTagToFriend, enrollFriendInScenario } from '@line-crm/db';
+import { enrollFriendInScenario } from '@line-crm/db';
+import { attachTagAndFireSideEffects } from '../services/friend-tag-attach.js';
 import type { TrackedLink } from '@line-crm/db';
 import type { Env } from '../index.js';
+import { isLinkPreviewBot } from '../lib/og-bot.js';
+import { buildOgHtml } from '../lib/og-html.js';
+import { resolveOgForTrackedLink } from '../lib/og-resolver.js';
+import { resolveTrackedLinkBaseUrl } from '../lib/link-base-url.js';
+import { awardActivityMileage } from '../services/activity-mileage.js';
+import { timingSafeEqualString } from '@line-crm/shared';
 
-const trackedLinks = new Hono<Env>();
+const trackedLinks = createAuthorizedRouter<Env>();
+
+function isHttpDestination(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^https?:\/\//i.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
 
 function serializeTrackedLink(row: TrackedLink, baseUrl: string) {
-  const trackingUrl = `${baseUrl}/t/${row.id}`;
+  // Prefer the short code (baseUrl may be a branded short domain).
+  const trackingUrl = `${baseUrl}/t/${row.short_code ?? row.id}`;
   return {
     id: row.id,
     name: row.name,
     originalUrl: row.original_url,
     trackingUrl,
+    shortCode: row.short_code,
     tagId: row.tag_id,
     scenarioId: row.scenario_id,
     introTemplateId: row.intro_template_id,
     rewardTemplateId: row.reward_template_id,
+    lineAccountId: row.line_account_id,
     isActive: Boolean(row.is_active),
     clickCount: row.click_count,
+    ogTitle: row.og_title,
+    ogDescription: row.og_description,
+    ogImageUrl: row.og_image_url,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -38,11 +63,128 @@ function getBaseUrl(c: { req: { url: string } }): string {
   return `${url.protocol}//${url.host}`;
 }
 
+/** Base for admin-facing trackingUrl: branded short domain or the request origin. */
+async function resolveApiLinkBase(c: { env: { DB: D1Database }; req: { url: string } }): Promise<string> {
+  return resolveTrackedLinkBaseUrl(c.env.DB, getBaseUrl(c));
+}
+
+/**
+ * Resolve the LINE account that owns a tracked link.
+ * Priority: tracked_links.line_account_id → scenario_id → scenarios.line_account_id.
+ * Returns null for legacy/unowned links (callers fall back to env defaults).
+ */
+async function resolveLinkAccount(
+  db: D1Database,
+  link: TrackedLink,
+): Promise<Record<string, unknown> | null> {
+  let accountId: string | null = link.line_account_id ?? null;
+  if (!accountId && link.scenario_id) {
+    const scRow = await db
+      .prepare(`SELECT line_account_id FROM scenarios WHERE id = ?`)
+      .bind(link.scenario_id)
+      .first<{ line_account_id: string | null }>();
+    accountId = scRow?.line_account_id ?? null;
+  }
+  if (!accountId) return null;
+  return db
+    .prepare(`SELECT * FROM line_accounts WHERE id = ?`)
+    .bind(accountId)
+    .first<Record<string, unknown>>();
+}
+
+/**
+ * How long one isolate may reuse its answer to "which accounts are active?".
+ *
+ * /t/ is a public redirect, so anything read per click is multiplied by the
+ * click volume. Staleness is bounded by this TTL and fails towards the previous
+ * answer: an account activated a moment ago is never mistaken for the only one
+ * (its id is not the cached one), and an account that just became the only one
+ * stays anonymous until the entry expires.
+ */
+export const ACTIVE_ACCOUNT_CACHE_TTL_MS = 60_000;
+
+interface ActiveAccountCacheEntry {
+  expiresAt: number;
+  /** Ids of up to two active accounts — enough to tell "exactly one" from "more". */
+  ids: string[];
+}
+
+/**
+ * Per-isolate cache, keyed by the D1 binding object so that two databases
+ * served by the same isolate never share an answer. A WeakMap needs no
+ * eviction; if the runtime hands out a new binding object it is only a miss.
+ *
+ * Only resolved answers are stored, never the pending query: on Workers a
+ * pending D1 read belongs to the request that started it, and a second click
+ * awaiting it could be left hanging if that first request is cancelled.
+ */
+const activeAccountCache = new WeakMap<D1Database, ActiveAccountCacheEntry>();
+
+async function getActiveAccountIds(db: D1Database): Promise<string[]> {
+  const cached = activeAccountCache.get(db);
+  if (cached && cached.expiresAt > Date.now()) return cached.ids;
+
+  // line_accounts has no index on is_active, so this reads the whole table
+  // (LIMIT 2 does not bound rows read). The table holds a handful of rows; the
+  // cache is what keeps it from being multiplied by clicks. Clicks that overlap
+  // while the cache is cold each issue their own read; a failed read throws
+  // before anything is stored, so the next click retries.
+  const res = await db
+    .prepare(`SELECT id FROM line_accounts WHERE is_active = 1 LIMIT 2`)
+    .all<{ id: string }>();
+  const ids = (res?.results ?? []).map((row) => row.id);
+  activeAccountCache.set(db, { expiresAt: Date.now() + ACTIVE_ACCOUNT_CACHE_TTL_MS, ids });
+  return ids;
+}
+
+/**
+ * Whether the global env.LIFF_URL can be treated as this account's own LIFF.
+ *
+ * True only when the account is active and
+ *   - env.LINE_CHANNEL_SECRET is configured and equals its channel_secret: it is
+ *     the default account (the same test the webhook uses to bind the env
+ *     channel to a DB row), or
+ *   - env.LINE_CHANNEL_SECRET is not configured and it is the only active
+ *     account, so there is no other business whose LIFF env.LIFF_URL could
+ *     belong to.
+ *
+ * A configured secret that does not match is decisive: env.LIFF_URL then
+ * belongs to the env channel, which need not be registered in line_accounts,
+ * so "the only active row" proves nothing.
+ *
+ * Any failure answers false: sending the click straight to the destination
+ * (anonymous) is safe, another account's LINE Login screen is not.
+ *
+ * Cost: the active-account read is reached only for a LINE in-app click without
+ * lu/f on a link whose owner has no liff_id, on an install without
+ * env.LINE_CHANNEL_SECRET. Once an answer is cached it is reused for
+ * ACTIVE_ACCOUNT_CACHE_TTL_MS per isolate per database; only clicks that
+ * overlap while the cache is cold read more than once.
+ */
+async function ownsGlobalLiff(
+  db: D1Database,
+  account: Record<string, unknown>,
+  envChannelSecret: string | undefined,
+): Promise<boolean> {
+  try {
+    if (!account.is_active) return false;
+    if (envChannelSecret) {
+      const secret = account.channel_secret;
+      return typeof secret === 'string' && secret !== '' && (await timingSafeEqualString(secret, envChannelSecret));
+    }
+    const activeIds = await getActiveAccountIds(db);
+    return activeIds.length === 1 && activeIds[0] === account.id;
+  } catch (err) {
+    console.error('ownsGlobalLiff error:', err);
+    return false;
+  }
+}
+
 // GET /api/tracked-links — list all
 trackedLinks.get('/api/tracked-links', async (c) => {
   try {
     const items = await getTrackedLinks(c.env.DB);
-    const base = getBaseUrl(c);
+    const base = await resolveApiLinkBase(c);
     return c.json({ success: true, data: items.map((item) => serializeTrackedLink(item, base)) });
   } catch (err) {
     console.error('GET /api/tracked-links error:', err);
@@ -59,7 +201,7 @@ trackedLinks.get('/api/tracked-links/:id', async (c) => {
       return c.json({ success: false, error: 'Tracked link not found' }, 404);
     }
     const clicks = await getLinkClicks(c.env.DB, id);
-    const base = getBaseUrl(c);
+    const base = await resolveApiLinkBase(c);
     return c.json({
       success: true,
       data: {
@@ -88,10 +230,17 @@ trackedLinks.post('/api/tracked-links', async (c) => {
       scenarioId?: string | null;
       introTemplateId?: string | null;
       rewardTemplateId?: string | null;
+      lineAccountId?: string | null;
+      ogTitle?: string | null;
+      ogDescription?: string | null;
+      ogImageUrl?: string | null;
     }>();
 
-    if (!body.name || !body.originalUrl) {
+    if (!body || typeof body.name !== 'string' || !body.name.trim() || !body.originalUrl) {
       return c.json({ success: false, error: 'name and originalUrl are required' }, 400);
+    }
+    if (!isHttpDestination(body.originalUrl)) {
+      return c.json({ success: false, error: 'originalUrl must be a valid http or https URL' }, 400);
     }
 
     const link = await createTrackedLink(c.env.DB, {
@@ -101,9 +250,13 @@ trackedLinks.post('/api/tracked-links', async (c) => {
       scenarioId: body.scenarioId ?? null,
       introTemplateId: body.introTemplateId ?? null,
       rewardTemplateId: body.rewardTemplateId ?? null,
+      lineAccountId: body.lineAccountId ?? null,
+      ogTitle: body.ogTitle ?? null,
+      ogDescription: body.ogDescription ?? null,
+      ogImageUrl: body.ogImageUrl ?? null,
     });
 
-    const base = getBaseUrl(c);
+    const base = await resolveApiLinkBase(c);
     return c.json({ success: true, data: serializeTrackedLink(link, base) }, 201);
   } catch (err) {
     console.error('POST /api/tracked-links error:', err);
@@ -121,14 +274,18 @@ trackedLinks.patch('/api/tracked-links/:id', async (c) => {
       scenarioId?: string | null;
       introTemplateId?: string | null;
       rewardTemplateId?: string | null;
+      lineAccountId?: string | null;
       isActive?: boolean;
+      ogTitle?: string | null;
+      ogDescription?: string | null;
+      ogImageUrl?: string | null;
     }>();
 
     const link = await updateTrackedLink(c.env.DB, id, body);
     if (!link) {
       return c.json({ success: false, error: 'Tracked link not found' }, 404);
     }
-    const base = getBaseUrl(c);
+    const base = await resolveApiLinkBase(c);
     return c.json({ success: true, data: serializeTrackedLink(link, base) });
   } catch (err) {
     console.error('PATCH /api/tracked-links/:id error:', err);
@@ -194,14 +351,29 @@ function getAndroidPackage(url: string): string | null {
   }
 }
 
+function serializeInlineScriptString(value: string): string {
+  // JSON escapes JS string delimiters, but HTML still recognizes </script>
+  // inside a string. Escape '<' before embedding JSON in a script element.
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
 function buildAppRedirectHtml(destinationUrl: string): string {
-  const escaped = destinationUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  const destinationJson = serializeInlineScriptString(destinationUrl);
+  const destinationAttribute = destinationUrl
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
   const androidPackage = getAndroidPackage(destinationUrl);
   // intent://path#Intent;scheme=https;package=com.xxx;S.browser_fallback_url=https://...;end
   const intentUrl = androidPackage
-    ? `intent://${destinationUrl.replace(/^https?:\/\//, '')}#Intent;scheme=https;package=${androidPackage};S.browser_fallback_url=${encodeURIComponent(destinationUrl)};end`
+    ? `intent://${destinationUrl.replace(/^https?:\/\//i, '')}#Intent;scheme=https;package=${androidPackage};S.browser_fallback_url=${encodeURIComponent(destinationUrl)};end`
     : null;
-  const intentEscaped = intentUrl ? intentUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;') : '';
+  const intentJson = serializeInlineScriptString(intentUrl ?? '');
 
   return `<!DOCTYPE html>
 <html><head>
@@ -214,40 +386,83 @@ function buildAppRedirectHtml(destinationUrl: string): string {
 <script>
 (function(){
   var isAndroid = /Android/i.test(navigator.userAgent);
-  if(isAndroid && "${intentEscaped}"){
-    window.location.href="${intentEscaped}";
+  if(isAndroid && ${intentJson}){
+    window.location.href=${intentJson};
   } else {
-    window.location.href="${escaped}";
+    window.location.href=${destinationJson};
   }
 })();
 </script>
-<noscript><meta http-equiv="refresh" content="0;url=${escaped}"></noscript>
+<noscript><meta http-equiv="refresh" content="0;url=${destinationAttribute}"></noscript>
 </body></html>`;
 }
 
 // GET /t/:linkId — click tracking redirect (no auth, fast redirect)
+// :linkId accepts both the legacy UUID and the 7-char short code.
 trackedLinks.get('/t/:linkId', async (c) => {
   const linkId = c.req.param('linkId');
   const lineUserId = c.req.query('lu') ?? null;
   let friendId = c.req.query('f') ?? null;
 
   // Look up the link first
-  const link = await getTrackedLinkById(c.env.DB, linkId);
+  const link = await getTrackedLinkByIdOrShortCode(c.env.DB, linkId);
 
   if (!link || !link.is_active) {
     return c.json({ success: false, error: 'Link not found' }, 404);
+  }
+  // Also protect legacy and automatically created records. An allowed app
+  // hostname does not make a javascript: (or other non-web) URL safe to open.
+  if (!isHttpDestination(link.original_url)) {
+    return c.json({ success: false, error: 'Invalid link destination' }, 400);
+  }
+
+  // Bot UA (LINE/X/Facebook 等のリンクプレビュー) → OGP HTML を返して終了。
+  // クリック記録もスキップ（bot のアクセスは CV ではない）。
+  const ua = c.req.header('user-agent') || '';
+  if (isLinkPreviewBot(ua)) {
+    const canonical = `${c.env.WORKER_URL || new URL(c.req.url).origin}/t/${linkId}`;
+    // link.line_account_id 優先、無ければ scenario 経由でアカウントを解決する。
+    // どちらも無いリンクは account=null（og:site_name='LINE' フォールバック）。
+    const account = await resolveLinkAccount(c.env.DB, link);
+    const og = resolveOgForTrackedLink(link, account as any, canonical);
+    return c.html(buildOgHtml(og));
   }
 
   const useAppRedirect = isAppLinkDomain(link.original_url);
 
   // If no user ID yet, check if this is LINE's in-app browser → redirect to LIFF for identification
   // Skip LIFF redirect for app-link domains (they'll come from Safari via externalBrowser)
-  const ua = c.req.header('user-agent') || '';
+  //
+  // LIFF はリンクを所有するアカウントのものを使う。グローバル env.LIFF_URL 固定だと
+  // 他アカウントの友だちに①の同意画面が出る（未同意チャネルの LIFF に飛ぶため）。
   const isLineApp = /\bLine\b/i.test(ua);
-  if (!useAppRedirect && !lineUserId && !friendId && isLineApp && c.env.LIFF_URL) {
-    const directUrl = `${c.env.WORKER_URL || new URL(c.req.url).origin}/t/${linkId}`;
-    const liffRedirect = `${c.env.LIFF_URL}?redirect=${encodeURIComponent(directUrl)}`;
-    return c.redirect(liffRedirect, 302);
+  if (!useAppRedirect && !lineUserId && !friendId && isLineApp) {
+    let liffBase: string | null = null;
+    const account = await resolveLinkAccount(c.env.DB, link);
+    const liffId = (account?.liff_id as string | null | undefined) ?? null;
+    if (liffId) {
+      liffBase = `https://liff.line.me/${liffId}`;
+    } else if (c.env.LIFF_URL && (!account || await ownsGlobalLiff(c.env.DB, account, c.env.LINE_CHANNEL_SECRET))) {
+      // 全体設定の LIFF (env.LIFF_URL) を使ってよいのは次のどれかのときだけ:
+      //   1. リンクの持ち主が分からない（持ち主を持たない古いリンク）
+      //   2. 持ち主が既定アカウント（env.LINE_CHANNEL_SECRET と同じチャネル）
+      //   3. env.LINE_CHANNEL_SECRET が未設定で、有効なアカウントが持ち主の1つだけ
+      //      （設定済みで一致しないなら LIFF_URL は env 側のチャネルのもの。DB に
+      //      登録されていないこともあるので「1つだけ」では判断しない）
+      // 2 と 3 は、liff_id を DB に入れず LIFF_URL だけで運用している単一アカウントの
+      // 自前環境のため。ここを外すと本人識別が効かず、クリックが全部匿名になる。
+      //
+      // それ以外（複数アカウントのうち liff_id を持たない、既定でないアカウント）を
+      // ここへ落とすと、よその事業の LINE ログイン画面がそのアカウントの友だちに出る。
+      // 2026-09-08 に実際に起きたので、そのアカウントは LIFF を経由しない
+      // （本人の識別ができないぶんクリックは匿名で記録されるが、飛び先は正しいままになる）。
+      liffBase = c.env.LIFF_URL;
+    }
+    if (liffBase) {
+      const directUrl = `${c.env.WORKER_URL || new URL(c.req.url).origin}/t/${linkId}`;
+      const liffRedirect = `${liffBase}?redirect=${encodeURIComponent(directUrl)}`;
+      return c.redirect(liffRedirect, 302);
+    }
   }
 
   // Resolve friendId from LINE user ID if provided
@@ -263,15 +478,34 @@ trackedLinks.get('/t/:linkId', async (c) => {
   ctx.waitUntil(
     (async () => {
       try {
-        // Record the click
-        await recordLinkClick(c.env.DB, linkId, friendId);
+        // Record the click (link.id, not the raw param — it may be a short code)
+        const click = await recordLinkClick(c.env.DB, link.id, friendId);
+
+        if (friendId) {
+          await awardActivityMileage(c.env.DB, {
+            eventType: 'link_clicked',
+            source: 'tracked_link',
+            sourceEventId: click.id,
+            friendId,
+            subjectKey: link.id,
+            metadata: { trackedLinkId: link.id, linkName: link.name },
+            occurredAt: click.clicked_at,
+          });
+        }
 
         // Run automatic actions if a friend is identified
         if (friendId) {
           const actions: Promise<unknown>[] = [];
 
           if (link.tag_id) {
-            actions.push(addTagToFriend(c.env.DB, friendId, link.tag_id));
+            // Guarded attach: fires tag_added scenario enrollment only when
+            // the tag is NEWLY applied — an in-app /t click must start a
+            // tag-triggered campaign exactly like the /auth/line ref path
+            // does, and stay silent on re-clicks.
+            actions.push(attachTagAndFireSideEffects(c.env.DB, friendId, link.tag_id, {
+              defaultAccessToken: c.env.LINE_CHANNEL_ACCESS_TOKEN,
+              workerUrl: c.env.WORKER_URL,
+            }));
           }
 
           if (link.scenario_id) {

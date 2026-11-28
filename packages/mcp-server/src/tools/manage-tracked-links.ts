@@ -5,7 +5,8 @@ import { getClient } from "../client.js";
 export function registerManageTrackedLinks(server: McpServer): void {
   server.tool(
     "manage_tracked_links",
-    "トラッキングリンクの管理操作。list: 一覧、update: 更新、delete: 削除。作成は create_tracked_link ツールを使用。",
+    "クリック計測用トラッキングリンク（/t/）の管理。list: 一覧、update: 更新、delete: 削除。作成は create_tracked_link を使用。" +
+      "流入リンク（/r/、entry routes）の一覧・更新・削除は manage_entry_routes を使用。",
     {
       action: z.enum(["list", "update", "delete"]).describe("Action to perform"),
       linkId: z.string().optional().describe("Tracked link ID (required for update/delete)"),
@@ -27,14 +28,26 @@ export function registerManageTrackedLinks(server: McpServer): void {
         .describe(
           "Message template ID to push as the reward message after form submission verification passes, or null to clear. Overrides the form's built-in on_submit_message. Use this when reusing one form across multiple campaigns with different rewards. (update only)",
         ),
+      accountId: z.string().nullable().optional().describe("LINE account ID that owns this link (used to resolve the LIFF for /t/ in-app redirects), or null to clear (update only)"),
       isActive: z.boolean().optional().describe("Whether the link is active (update only)"),
+      ogTitle: z.string().nullable().optional().describe("OGP title override for the tracking link preview, or null to clear (update only)"),
+      ogDescription: z.string().nullable().optional().describe("OGP description override for the tracking link preview, or null to clear (update only)"),
+      ogImageUrl: z.string().nullable().optional().describe("OGP image URL override for the tracking link preview, or null to clear (update only)"),
     },
-    async ({ action, linkId, name, tagId, scenarioId, introTemplateId, rewardTemplateId, isActive }) => {
+    { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    async ({ action, linkId, name, tagId, scenarioId, introTemplateId, rewardTemplateId, accountId, isActive, ogTitle, ogDescription, ogImageUrl }) => {
       try {
         const client = getClient();
         if (action === "list") {
           const links = await client.trackedLinks.list();
-          return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, trackedLinks: links }, null, 2) }] };
+          const result = {
+            success: true,
+            trackedLinks: links,
+            ...(links.length === 0
+              ? { _hint: "クリック計測リンク（/t/）はありません。流入リンク（/r/）の一覧は manage_entry_routes を action=list で呼び出してください。" }
+              : {}),
+          };
+          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
         }
         if (action === "update") {
           if (!linkId) throw new Error("linkId is required for update");
@@ -44,7 +57,11 @@ export function registerManageTrackedLinks(server: McpServer): void {
             scenarioId,
             introTemplateId,
             rewardTemplateId,
+            lineAccountId: accountId,
             isActive,
+            ogTitle,
+            ogDescription,
+            ogImageUrl,
           });
           return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, link }, null, 2) }] };
         }
