@@ -5,7 +5,7 @@ import { getClient } from "../client.js";
 export function registerListConversations(server: McpServer): void {
   server.tool(
     "list_conversations",
-    "List unreplied conversations (friends who sent an incoming message with no subsequent human reply). Excludes automated outgoing (broadcast/scenario/auto_reply/reminder). Results sorted by longest wait first.",
+    "List unreplied conversations (friends who sent an incoming message with no subsequent human reply). Excludes automated outgoing (broadcast/scenario/auto_reply/reminder) and conversations marked resolved in the admin UI. Results sorted by longest wait first.",
     {
       lineAccountId: z
         .string()
@@ -25,6 +25,7 @@ export function registerListConversations(server: McpServer): void {
         .describe("Number of conversations to return (max 200)"),
       offset: z.number().default(0).describe("Offset for pagination"),
     },
+    { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
     async ({ lineAccountId, minHoursSince, maxHoursSince, limit, offset }) => {
       try {
         const client = getClient();

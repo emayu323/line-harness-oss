@@ -16,6 +16,7 @@ export function registerManageAutoReplies(server: McpServer): void {
       lineAccountId: z.string().nullable().optional().describe("LINE account ID filter (for list, create, update)"),
       isActive: z.boolean().optional().describe("Active status (for update)"),
     },
+    { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     async ({ action, autoReplyId, keyword, matchType, responseType, responseContent, lineAccountId, isActive }) => {
       try {
         const client = getClient();
@@ -33,7 +34,7 @@ export function registerManageAutoReplies(server: McpServer): void {
           if (matchType !== undefined) createInput.matchType = matchType;
           if (responseType !== undefined) createInput.responseType = responseType;
           if (lineAccountId !== undefined) createInput.lineAccountId = lineAccountId;
-          const item = await client.autoReplies.create(createInput as Parameters<typeof client.autoReplies.create>[0]);
+          const item = await client.autoReplies.create(createInput as unknown as Parameters<typeof client.autoReplies.create>[0]);
           return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, autoReply: item }, null, 2) }] };
         }
         if (!autoReplyId) throw new Error("autoReplyId is required for this action");
